@@ -44,6 +44,70 @@ const ganeshImages: GaneshImage[] = [
   }
 ];
 
+// Client-side photo compression: resize + re-encode uploaded photos before
+// they're base64-encoded and sent to the backend. Phone camera photos are
+// routinely 8-12MB, well over the backend's 10MB decoded cap and slow to
+// upload/process; downscaling to a sane max dimension and re-encoding as
+// JPEG shrinks that dramatically with no visible quality loss for a
+// composite that's ultimately displayed on screen.
+const MAX_PHOTO_DIMENSION = 1600; // px, longest side
+const PHOTO_JPEG_QUALITY = 0.85;
+const MAX_UPLOAD_FILE_BYTES = 25 * 1024 * 1024; // sanity cap on the *original* file, before compression
+
+function readFileAsDataURL(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(reader.error ?? new Error('Failed to read file'));
+    reader.readAsDataURL(file);
+  });
+}
+
+function loadImage(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('Could not decode image data'));
+    img.src = src;
+  });
+}
+
+/** Resize (if needed) and re-encode a user photo as JPEG via canvas.
+ *  Returns the original data URL unchanged if compression isn't possible or
+ *  wouldn't help (e.g. the browser lacks canvas support), so a photo is
+ *  never blocked from upload just because optimization failed. */
+async function compressPhoto(file: File): Promise<{ dataUrl: string; originalBytes: number }> {
+  const originalDataUrl = await readFileAsDataURL(file);
+
+  try {
+    const img = await loadImage(originalDataUrl);
+    const scale = Math.min(1, MAX_PHOTO_DIMENSION / Math.max(img.width, img.height));
+    const width = Math.max(1, Math.round(img.width * scale));
+    const height = Math.max(1, Math.round(img.height * scale));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      return { dataUrl: originalDataUrl, originalBytes: file.size };
+    }
+
+    ctx.drawImage(img, 0, 0, width, height);
+    const compressedDataUrl = canvas.toDataURL('image/jpeg', PHOTO_JPEG_QUALITY);
+    return { dataUrl: compressedDataUrl, originalBytes: file.size };
+  } catch (error) {
+    console.warn('Photo compression failed, using original file instead:', error);
+    return { dataUrl: originalDataUrl, originalBytes: file.size };
+  }
+}
+
+/** Rough decoded byte size of a base64 data URL, for user-facing messaging. */
+function estimateDataUrlBytes(dataUrl: string): number {
+  const base64 = dataUrl.split(',', 2)[1] ?? '';
+  return Math.round((base64.length * 3) / 4);
+}
+
 function App() {
   const [step, setStep] = useState(1);
   const [selectedGanesh, setSelectedGanesh] = useState<string>('');
@@ -55,6 +119,7 @@ function App() {
   const [generatedImage, setGeneratedImage] = useState<string>('');
   const [dragActive, setDragActive] = useState(false);
   const [isLoadingLogos, setIsLoadingLogos] = useState(true);
+  const [isProcessingPhoto, setIsProcessingPhoto] = useState(false);
 
   // Load logos from backend
   useEffect(() => {
@@ -95,18 +160,37 @@ function App() {
     }
   };
 
-  const handleFile = (file: File) => {
-    if (file.type.startsWith('image/')) {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        const result = e.target?.result as string;
-        setUserPhoto(result);
-        setUserPhotoBase64(result);
-        toast.success('Photo uploaded successfully!');
-      };
-      reader.readAsDataURL(file);
-    } else {
+  const handleFile = async (file: File) => {
+    if (!file.type.startsWith('image/')) {
       toast.error('Please upload an image file');
+      return;
+    }
+    if (file.size > MAX_UPLOAD_FILE_BYTES) {
+      toast.error(
+        `Photo is too large (${Math.round(file.size / 1024 / 1024)}MB). Please choose a photo under ${Math.round(MAX_UPLOAD_FILE_BYTES / 1024 / 1024)}MB.`
+      );
+      return;
+    }
+
+    setIsProcessingPhoto(true);
+    try {
+      const { dataUrl, originalBytes } = await compressPhoto(file);
+      setUserPhoto(dataUrl);
+      setUserPhotoBase64(dataUrl);
+
+      const compressedBytes = estimateDataUrlBytes(dataUrl);
+      if (compressedBytes < originalBytes * 0.9) {
+        const originalKb = Math.round(originalBytes / 1024);
+        const compressedKb = Math.round(compressedBytes / 1024);
+        toast.success(`Photo optimized (${originalKb}KB → ${compressedKb}KB)`);
+      } else {
+        toast.success('Photo uploaded successfully!');
+      }
+    } catch (error) {
+      console.error('Failed to process photo:', error);
+      toast.error('Could not process that photo. Please try a different image.');
+    } finally {
+      setIsProcessingPhoto(false);
     }
   };
 
@@ -265,15 +349,21 @@ function App() {
                   <h2 className="text-2xl font-bold text-gray-800">Upload Your Photo</h2>
                 </div>
 
-                {!userPhoto ? (
+                {isProcessingPhoto ? (
+                  <div className="border-2 border-dashed border-orange-300 bg-orange-50 rounded-xl p-12 text-center">
+                    <Loader2 className="w-10 h-10 text-orange-500 mx-auto mb-4 animate-spin" />
+                    <h3 className="text-lg font-semibold text-gray-700">Optimizing your photo...</h3>
+                    <p className="text-gray-500 mt-1">Resizing and compressing for a faster upload</p>
+                  </div>
+                ) : !userPhoto ? (
                   <div
                     onDragEnter={handleDrag}
                     onDragLeave={handleDrag}
                     onDragOver={handleDrag}
                     onDrop={handleDrop}
                     className={`border-2 border-dashed rounded-xl p-12 text-center transition-all duration-300 ${
-                      dragActive 
-                        ? 'border-orange-500 bg-orange-50' 
+                      dragActive
+                        ? 'border-orange-500 bg-orange-50'
                         : 'border-gray-300 hover:border-orange-400 hover:bg-orange-50'
                     }`}
                   >

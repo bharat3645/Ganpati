@@ -3,16 +3,18 @@ import io
 import base64
 import ipaddress
 import socket
+import time
+from collections import defaultdict, deque
 from pathlib import Path
 from urllib.parse import urlparse
 import requests
 from PIL import Image, UnidentifiedImageError
 from rembg import remove
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, field_validator
-from typing import List
+from pydantic import BaseModel, ConfigDict, field_validator
+from typing import Dict, List
 import uvicorn
 from huggingface_hub import InferenceClient
 from dotenv import load_dotenv
@@ -25,7 +27,22 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Festive AI Greetings API", version="1.0.0")
+app = FastAPI(
+    title="Festive AI Greetings API",
+    version="1.0.0",
+    description=(
+        "Backend for Ganpati: composites a user's photo and an organization "
+        "logo onto a Ganesh Chaturthi backdrop, with optional AI "
+        "photorealistic enhancement. See the README for the full pipeline."
+    ),
+    contact={"name": "Ganpati", "url": "https://github.com/bharat3645/Ganpati"},
+    license_info={"name": "MIT", "url": "https://github.com/bharat3645/Ganpati/blob/main/LICENSE"},
+    openapi_tags=[
+        {"name": "assets", "description": "Read-only lookups of the backdrops/logos the wizard offers."},
+        {"name": "generate", "description": "The core image-compositing endpoint."},
+        {"name": "meta", "description": "Health/status endpoints."},
+    ],
+)
 
 # CORS middleware
 # Configurable via CORS_ORIGINS env var (comma-separated). Defaults to common
@@ -58,6 +75,67 @@ ALLOWED_IMAGE_FORMATS = {"JPEG", "PNG", "WEBP", "BMP", "GIF"}
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 
 
+# --- Rate limiting ---------------------------------------------------------
+# /api/generate is by far the most expensive endpoint (rembg background
+# removal plus an optional remote AI call), so it's the one endpoint that
+# needs protection from casual abuse before this could be deployed publicly
+# (see README "Security" section). Configurable via env vars; defaults to a
+# generous-but-real 10 requests/minute per client IP.
+RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "10"))
+RATE_LIMIT_WINDOW_SECONDS = float(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60"))
+
+
+class RateLimiter:
+    """A simple in-memory sliding-window rate limiter, usable as a FastAPI
+    dependency.
+
+    Deliberately dependency-free (stdlib only) to avoid repeating the kind of
+    fragile transitive-dependency surprise that `rembg`/`pymatting` caused
+    elsewhere in this project. State lives in process memory: it resets on
+    restart and is *not* shared across multiple worker processes/replicas.
+    That's an accepted tradeoff at this project's scale (the same tradeoff
+    already made for `LOGOS_DB`) -- back this with Redis or similar if this
+    is ever run with more than one worker.
+    """
+
+    def __init__(self, max_requests: int, window_seconds: float):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._hits: Dict[str, deque] = defaultdict(deque)
+
+    @staticmethod
+    def _client_key(request: Request) -> str:
+        client = request.client
+        return client.host if client else "unknown"
+
+    async def __call__(self, request: Request) -> None:
+        now = time.monotonic()
+        key = self._client_key(request)
+        hits = self._hits[key]
+
+        # Drop timestamps that have aged out of the window.
+        while hits and now - hits[0] > self.window_seconds:
+            hits.popleft()
+
+        if len(hits) >= self.max_requests:
+            retry_after = max(0.0, self.window_seconds - (now - hits[0]))
+            logger.warning(f"Rate limit exceeded for client '{key}'")
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Rate limit exceeded: max {self.max_requests} requests "
+                    f"per {int(self.window_seconds)}s. Try again in "
+                    f"{retry_after:.0f}s."
+                ),
+                headers={"Retry-After": str(int(retry_after) + 1)},
+            )
+
+        hits.append(now)
+
+
+generate_rate_limiter = RateLimiter(RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_SECONDS)
+
+
 # Pydantic models
 class GenerateRequest(BaseModel):
     # A known backdrop id (see GANESH_IMAGES_DB), *not* an arbitrary URL.
@@ -70,6 +148,16 @@ class GenerateRequest(BaseModel):
     ganeshImageId: str
     userPhotoBase64: str
     selectedLogoId: str
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "ganeshImageId": "ganesh_1",
+                "userPhotoBase64": "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQ...",
+                "selectedLogoId": "logo_01",
+            }
+        }
+    )
 
     @field_validator("ganeshImageId", "selectedLogoId")
     @classmethod
@@ -98,6 +186,22 @@ class Logo(BaseModel):
 class GaneshBackdrop(BaseModel):
     id: str
     name: str
+
+class GenerateResponse(BaseModel):
+    success: bool
+    imageUrl: str
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "success": True,
+                "imageUrl": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB...",
+            }
+        }
+    )
+
+class ErrorResponse(BaseModel):
+    detail: str
 
 # Known Ganesh backdrops, bundled locally under backend/assets/. Keep this in
 # sync with the images offered in the frontend (src/App.tsx `ganeshImages`).
@@ -146,11 +250,11 @@ if not HF_TOKEN:
         "to backend/.env and set HF_TOKEN to enable AI enhancement."
     )
 
-@app.get("/")
+@app.get("/", tags=["meta"], summary="API root / liveness")
 async def root():
     return {"message": "Festive AI Greetings API is running!", "status": "healthy"}
 
-@app.get("/api/logos", response_model=List[Logo])
+@app.get("/api/logos", response_model=List[Logo], tags=["assets"], summary="List available organization logos")
 async def get_logos():
     """Get available corporate logos"""
     try:
@@ -160,7 +264,12 @@ async def get_logos():
         logger.error(f"Error fetching logos: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to fetch logos")
 
-@app.get("/api/ganesh-images", response_model=List[GaneshBackdrop])
+@app.get(
+    "/api/ganesh-images",
+    response_model=List[GaneshBackdrop],
+    tags=["assets"],
+    summary="List available Ganesh backdrops",
+)
 async def get_ganesh_images():
     """Get available Ganesh backdrop ids/names (the images themselves are
     bundled as static assets; this just documents the valid ids accepted by
@@ -460,9 +569,28 @@ async def generate_ai_image(base_image: Image.Image) -> Image.Image:
         # Return base image if AI generation fails
         return base_image
 
-@app.post("/api/generate")
+@app.post(
+    "/api/generate",
+    response_model=GenerateResponse,
+    tags=["generate"],
+    summary="Composite a festive greeting image",
+    dependencies=[Depends(generate_rate_limiter)],
+    responses={
+        400: {"model": ErrorResponse, "description": "Invalid ganeshImageId/selectedLogoId, or malformed/oversized/corrupt photo data"},
+        422: {"description": "Request failed schema validation (missing/blank field, or grossly oversized payload)"},
+        429: {"description": f"Rate limit exceeded (default: {RATE_LIMIT_MAX_REQUESTS} requests / {int(RATE_LIMIT_WINDOW_SECONDS)}s per client)"},
+        500: {"model": ErrorResponse, "description": "Unexpected server error"},
+    },
+)
 async def generate_greeting(request: GenerateRequest):
-    """Generate festive greeting image"""
+    """Generate festive greeting image.
+
+    Removes the background from the uploaded photo, composites the person
+    and the selected logo onto the chosen Ganesh backdrop, and (if
+    `HF_TOKEN` is configured) runs the result through an AI image-to-image
+    model for a more photorealistic finish. Rate-limited per client IP --
+    see the `RATE_LIMIT_MAX_REQUESTS` / `RATE_LIMIT_WINDOW_SECONDS` env vars.
+    """
     try:
         logger.info("Starting image generation process")
 
@@ -518,7 +646,7 @@ async def generate_greeting(request: GenerateRequest):
         logger.error(f"Unexpected error in generate_greeting: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-@app.get("/health")
+@app.get("/health", tags=["meta"], summary="Health check")
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "message": "API is running"}

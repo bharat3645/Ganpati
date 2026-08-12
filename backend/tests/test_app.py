@@ -14,6 +14,7 @@ from app import (
     GANESH_IMAGES_DB,
     LOGOS_DB,
     MAX_USER_PHOTO_BYTES,
+    RateLimiter,
     _assert_public_http_url,
     decode_base64_image,
     load_local_ganesh_image,
@@ -220,3 +221,71 @@ def test_assert_public_http_url_allows_public_address(monkeypatch):
     monkeypatch.setattr(app_module.socket, "getaddrinfo", fake_getaddrinfo)
     # Should not raise.
     _assert_public_http_url("https://example.com/logo.png")
+
+
+# --- Rate limiting on POST /api/generate ------------------------------------
+
+def test_generate_rate_limit_returns_429_after_threshold(client, tiny_photo_base64, monkeypatch):
+    # Lower the limiter's threshold for this test only; the autouse
+    # _reset_rate_limiter fixture clears state before/after so this doesn't
+    # leak into other tests.
+    monkeypatch.setattr(app_module.generate_rate_limiter, "max_requests", 2)
+    monkeypatch.setattr(app_module.generate_rate_limiter, "window_seconds", 60.0)
+
+    payload = {
+        "ganeshImageId": "ganesh_1",
+        "userPhotoBase64": tiny_photo_base64,
+        "selectedLogoId": "logo_01",
+    }
+
+    assert client.post("/api/generate", json=payload).status_code == 200
+    assert client.post("/api/generate", json=payload).status_code == 200
+
+    third = client.post("/api/generate", json=payload)
+    assert third.status_code == 429
+    assert "Retry-After" in third.headers
+    assert "Rate limit exceeded" in third.json()["detail"]
+
+
+def test_generate_rate_limit_is_per_client_ip(monkeypatch):
+    # Two different client IPs each get their own budget.
+    limiter = RateLimiter(max_requests=1, window_seconds=60.0)
+
+    class FakeClient:
+        def __init__(self, host):
+            self.host = host
+
+    class FakeRequest:
+        def __init__(self, host):
+            self.client = FakeClient(host)
+
+    import asyncio
+
+    asyncio.run(limiter(FakeRequest("1.1.1.1")))
+    asyncio.run(limiter(FakeRequest("2.2.2.2")))  # different IP: not limited
+
+    with pytest.raises(Exception):
+        asyncio.run(limiter(FakeRequest("1.1.1.1")))  # same IP again: limited
+
+
+def test_rate_limiter_resets_after_window_elapses(monkeypatch):
+    limiter = RateLimiter(max_requests=1, window_seconds=10.0)
+
+    class FakeClient:
+        host = "9.9.9.9"
+
+    class FakeRequest:
+        client = FakeClient()
+
+    import asyncio
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(app_module.time, "monotonic", lambda: clock["t"])
+
+    asyncio.run(limiter(FakeRequest()))
+    with pytest.raises(Exception):
+        asyncio.run(limiter(FakeRequest()))
+
+    # Advance time past the window -- the earlier hit should age out.
+    clock["t"] += 11.0
+    asyncio.run(limiter(FakeRequest()))  # should not raise

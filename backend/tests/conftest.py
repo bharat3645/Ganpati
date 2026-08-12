@@ -64,3 +64,17 @@ def _stub_slow_external_calls(monkeypatch):
 
     monkeypatch.setattr(app_module, "fetch_image_from_url", _fake_fetch_image_from_url)
     monkeypatch.setattr(app_module, "remove_background", _fake_remove_background)
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limiter():
+    """The rate limiter (backend/app.py::generate_rate_limiter) is a
+    module-level singleton keyed by client IP, and every TestClient request
+    in this suite shares the same host ("testclient"). Without resetting its
+    state between tests, unrelated tests would trip each other's rate limit
+    just from running in the same session. Tests that specifically exercise
+    the limiter lower its thresholds via monkeypatch instead of relying on
+    this reset."""
+    app_module.generate_rate_limiter._hits.clear()
+    yield
+    app_module.generate_rate_limiter._hits.clear()
