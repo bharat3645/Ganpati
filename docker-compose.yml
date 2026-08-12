@@ -1,0 +1,41 @@
+# Runs the full stack: `docker compose up --build`
+#   Frontend -> http://localhost:5173
+#   Backend  -> http://localhost:8000
+#
+# Set HF_TOKEN in a .env file at the repo root (see backend/.env.example) to
+# enable AI-enhanced output; the app works fine without it (base composite
+# only). docker-compose automatically loads a root-level .env file.
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+    volumes:
+      # Persist rembg's downloaded ONNX model across restarts instead of
+      # re-fetching it every time the container is recreated.
+      - rembg-model-cache:/app/.u2net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+
+volumes:
+  rembg-model-cache:

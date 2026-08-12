@@ -1,0 +1,15 @@
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pillow==10.1.0
+rembg==2.0.57
+huggingface-hub==0.19.4
+requests==2.31.0
+python-multipart==0.0.6
+pydantic==2.5.0
+python-dotenv==1.0.1
+
+# rembg's dependency resolution can otherwise pick an incompatible pymatting:
+# 1.1.10 and earlier crash on NumPy 2.x (removed np.bool8), and later
+# releases restructured/dropped the "cutout" submodule rembg imports.
+# 1.1.11 is the version confirmed to work with current NumPy.
+pymatting==1.1.11
